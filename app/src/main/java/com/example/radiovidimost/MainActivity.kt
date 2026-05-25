@@ -8,10 +8,13 @@ import android.os.Looper
 import android.webkit.WebSettings
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.ServiceWorkerClient
+import android.webkit.ServiceWorkerController
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageView
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.ComponentActivity
 import androidx.webkit.WebViewAssetLoader
 
@@ -26,6 +29,18 @@ class MainActivity : ComponentActivity() {
         assetLoader = WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
+
+        ServiceWorkerController.getInstance().apply {
+            serviceWorkerWebSettings.setAllowContentAccess(true)
+            serviceWorkerWebSettings.setAllowFileAccess(true)
+            serviceWorkerWebSettings.setBlockNetworkLoads(false)
+            serviceWorkerWebSettings.setCacheMode(WebSettings.LOAD_DEFAULT)
+            setServiceWorkerClient(object : ServiceWorkerClient() {
+                override fun shouldInterceptRequest(request: WebResourceRequest): WebResourceResponse? {
+                    return assetLoader.shouldInterceptRequest(request.url)
+                }
+            })
+        }
 
         webView = WebView(this).apply {
             webViewClient = object : WebViewClient() {
@@ -72,16 +87,19 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
         webView.loadUrl("https://appassets.androidplatform.net/assets/index.html")
 
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                } else {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                }
+            }
+        })
+
         Handler(Looper.getMainLooper()).postDelayed({
             root.removeView(splash)
         }, 3000)
-    }
-
-    override fun onBackPressed() {
-        if (::webView.isInitialized && webView.canGoBack()) {
-            webView.goBack()
-        } else {
-            super.onBackPressed()
-        }
     }
 }

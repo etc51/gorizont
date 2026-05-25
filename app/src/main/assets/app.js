@@ -15,6 +15,14 @@ const VIEWPORT_CACHE_KEY = "viewport";
 const ROUTE_CACHE_KEY = "route";
 const SETTINGS_CACHE_KEY = "settings";
 const LAST_PLACES_CACHE_KEY = "places:last";
+const PLACE_KIND_WEIGHT = {
+  city: 0,
+  town: 1,
+  village: 2,
+  settlement: 2,
+  suburb: 3,
+  hamlet: 4,
+};
 const MIN_DRAG_DISTANCE_PX = 4;
 const DEFAULT_PLACES = [
   { lat: 48.0028, lng: 37.8053, name: "Донецк", kind: "city" },
@@ -55,6 +63,8 @@ const state = {
   saveTimer: null,
   renderFrame: 0,
   tileWarmups: new Set(),
+  tileWarmupQueue: [],
+  tileWarmupActive: 0,
 };
 
 const elements = {
@@ -67,7 +77,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260525-cache3").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260525-cache6").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -288,9 +298,21 @@ function renderPlaces(topLeft) {
   if (!state.places.length) return;
 
   const rect = elements.map.getBoundingClientRect();
+  const occupied = [];
   for (const place of state.places) {
     const screen = latLngToScreen(place, topLeft);
     if (screen.x < -80 || screen.y < -24 || screen.x > rect.width + 80 || screen.y > rect.height + 24) continue;
+    const isMajorPlace = place.kind === "city" || place.kind === "town";
+    const labelWidth = Math.min(190, Math.max(46, place.name.length * (isMajorPlace ? 8.2 : 7.1) + 12));
+    const labelHeight = isMajorPlace ? 22 : 18;
+    const box = {
+      left: screen.x - labelWidth / 2,
+      right: screen.x + labelWidth / 2,
+      top: screen.y - labelHeight / 2,
+      bottom: screen.y + labelHeight / 2,
+    };
+    if (occupied.some((item) => boxesOverlap(item, box))) continue;
+    occupied.push(box);
 
     const label = document.createElement("div");
     label.className = `place-label place-${place.kind || "settlement"}`;
@@ -338,6 +360,7 @@ async function loadPlaceLabels() {
         kind: item.tags && item.tags.place,
       }))
       .filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng) && place.name))
+      .sort(comparePlaces)
       .slice(0, getPlaceLimitForZoom(state.zoom));
     if (state.places.length > 0) {
       writeCache(cacheKey, state.places);
@@ -371,7 +394,7 @@ function restoreCachedPlacesForCurrentView() {
 }
 
 function getPlaceCacheInfo() {
-  const bounds = getMapBounds();
+  const bounds = snapBoundsToGrid(getMapBounds(), getPlaceGridSizeForZoom(state.zoom));
   const placeKinds = getPlaceKindsForZoom(state.zoom);
   const key = [
     state.zoom,
@@ -403,15 +426,46 @@ function renderCurrentOverlays() {
 }
 
 function getPlaceKindsForZoom(zoom) {
+  if (zoom <= 8) return "city";
   if (zoom <= 10) return "city|town";
   if (zoom <= 12) return "city|town|village";
   return "city|town|village|hamlet|suburb";
 }
 
 function getPlaceLimitForZoom(zoom) {
+  if (zoom <= 8) return 18;
   if (zoom <= 10) return 35;
   if (zoom <= 12) return 70;
   return 120;
+}
+
+function getPlaceGridSizeForZoom(zoom) {
+  if (zoom <= 7) return 2;
+  if (zoom <= 9) return 1;
+  if (zoom <= 11) return 0.25;
+  if (zoom <= 13) return 0.1;
+  return 0.05;
+}
+
+function snapBoundsToGrid(bounds, grid) {
+  return {
+    north: clampLatitude(Math.ceil(bounds.north / grid) * grid),
+    south: clampLatitude(Math.floor(bounds.south / grid) * grid),
+    west: clampLongitude(Math.floor(bounds.west / grid) * grid),
+    east: clampLongitude(Math.ceil(bounds.east / grid) * grid),
+  };
+}
+
+function clampLatitude(value) {
+  return Math.max(-85, Math.min(85, value));
+}
+
+function clampLongitude(value) {
+  return Math.max(-180, Math.min(180, value));
+}
+
+function boxesOverlap(a, b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 }
 
 function cleanPlaceName(name) {
@@ -427,6 +481,13 @@ function uniquePlaces(places) {
     seen.add(key);
     return true;
   });
+}
+
+function comparePlaces(a, b) {
+  const weightA = PLACE_KIND_WEIGHT[a.kind] ?? 5;
+  const weightB = PLACE_KIND_WEIGHT[b.kind] ?? 5;
+  if (weightA !== weightB) return weightA - weightB;
+  return a.name.localeCompare(b.name, "ru");
 }
 
 async function fetchPlaceData(overpassQuery, bounds) {
@@ -725,12 +786,29 @@ function writeCache(key, value) {
 }
 
 function pruneCache() {
-  const keys = [];
+  const protectedKeys = new Set([
+    CACHE_PREFIX + VIEWPORT_CACHE_KEY,
+    CACHE_PREFIX + ROUTE_CACHE_KEY,
+    CACHE_PREFIX + SETTINGS_CACHE_KEY,
+    CACHE_PREFIX + LAST_PLACES_CACHE_KEY,
+  ]);
+  const entries = [];
   for (let i = 0; i < localStorage.length; i += 1) {
     const key = localStorage.key(i);
-    if (key && key.startsWith(CACHE_PREFIX)) keys.push(key);
+    if (!key || !key.startsWith(CACHE_PREFIX) || protectedKeys.has(key)) continue;
+    let time = 0;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key));
+      time = Number(parsed && parsed.time) || 0;
+    } catch {
+      time = 0;
+    }
+    entries.push({ key, time });
   }
-  keys.slice(0, Math.ceil(keys.length / 2)).forEach((key) => localStorage.removeItem(key));
+  entries
+    .sort((a, b) => a.time - b.time)
+    .slice(0, Math.max(1, Math.ceil(entries.length / 2)))
+    .forEach((entry) => localStorage.removeItem(entry.key));
 }
 
 function readInitialViewport() {
@@ -806,21 +884,40 @@ function saveSettings() {
 
 function warmTileCache(url) {
   if (!("caches" in window) || !url) return;
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) return;
   if (state.tileWarmups.has(url)) return;
   if (state.tileWarmups.size > 2000) state.tileWarmups.clear();
   state.tileWarmups.add(url);
+  state.tileWarmupQueue.push(url);
+  processTileWarmupQueue();
+}
 
+function processTileWarmupQueue() {
+  if (state.tileWarmupActive >= 2) return;
+  const url = state.tileWarmupQueue.shift();
+  if (!url) return;
+
+  state.tileWarmupActive += 1;
   const run = async () => {
+    let storedOrCached = false;
     try {
       const cache = await caches.open(TILE_RUNTIME_CACHE);
       const cached = await cache.match(url);
-      if (cached) return;
-      const response = await fetch(url, { mode: "no-cors", cache: "force-cache" });
-      if (response.ok || response.type === "opaque") {
-        await cache.put(url, response.clone());
+      if (!cached) {
+        const response = await fetch(url, { mode: "no-cors", cache: "force-cache" });
+        if (response.ok || response.type === "opaque") {
+          await cache.put(url, response.clone());
+          storedOrCached = true;
+        }
+      } else {
+        storedOrCached = true;
       }
     } catch {
       // Service worker caching still covers normal online use; this is only a first-run warmup.
+    } finally {
+      if (!storedOrCached) state.tileWarmups.delete(url);
+      state.tileWarmupActive -= 1;
+      processTileWarmupQueue();
     }
   };
 

@@ -1,7 +1,7 @@
-const STATIC_CACHE = "radiovidimost-static-v8";
+const STATIC_CACHE = "radiovidimost-static-v11";
 const TILE_CACHE = "radiovidimost-tiles-v1";
 const DATA_CACHE = "radiovidimost-data-v2";
-const STATIC_ASSETS = ["./index.html", "./styles.css", "./app.js?v=20260525-cache3", "./sw.js?v=20260525-cache3"];
+const STATIC_ASSETS = ["./index.html", "./styles.css", "./app.js?v=20260525-cache6", "./sw.js?v=20260525-cache6"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -39,7 +39,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  if (url.hostname === location.hostname) {
+  if (url.hostname === location.hostname && url.pathname.startsWith("/assets/")) {
     event.respondWith(networkFirst(request, STATIC_CACHE));
   }
 });
@@ -50,7 +50,9 @@ async function cacheFirst(request, cacheName) {
   if (cached) return cached;
 
   const response = await fetch(request);
-  cache.put(request, response.clone()).catch(() => {});
+  if (response.ok || response.type === "opaque") {
+    cache.put(request, response.clone()).catch(() => {});
+  }
   return response;
 }
 
@@ -58,7 +60,9 @@ async function networkFirst(request, cacheName) {
   const cache = await caches.open(cacheName);
   try {
     const response = await fetch(request);
-    cache.put(request, response.clone()).catch(() => {});
+    if (response.ok || response.type === "opaque") {
+      cache.put(request, response.clone()).catch(() => {});
+    }
     return response;
   } catch (error) {
     const cached = await cache.match(request);
