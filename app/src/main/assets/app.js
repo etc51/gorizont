@@ -6,16 +6,45 @@ const DEFAULT_CLEARANCE_RATIO = 0.6;
 const DEFAULT_K_FACTOR = 1.33;
 const EDGE_IGNORE_RATIO = 0.1;
 const DEM_SAMPLE_COUNT = 60;
+const DEM_CHUNK_SIZE = 60;
 const CACHE_PREFIX = "rf-calc-cache-v2:";
-const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CACHE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+const TILE_RUNTIME_CACHE = "radiovidimost-tiles-v1";
+const DEFAULT_VIEWPORT = { zoom: 10, center: { lat: 48.015883, lng: 37.80285 } };
+const VIEWPORT_CACHE_KEY = "viewport";
+const ROUTE_CACHE_KEY = "route";
+const SETTINGS_CACHE_KEY = "settings";
+const LAST_PLACES_CACHE_KEY = "places:last";
+const MIN_DRAG_DISTANCE_PX = 4;
+const DEFAULT_PLACES = [
+  { lat: 48.0028, lng: 37.8053, name: "Донецк", kind: "city" },
+  { lat: 48.0478, lng: 37.9258, name: "Макеевка", kind: "city" },
+  { lat: 48.1298, lng: 37.8594, name: "Ясиноватая", kind: "town" },
+  { lat: 48.1399, lng: 37.7425, name: "Авдеевка", kind: "town" },
+  { lat: 48.3071, lng: 38.0296, name: "Горловка", kind: "city" },
+  { lat: 47.8903, lng: 38.0631, name: "Моспино", kind: "town" },
+  { lat: 47.831, lng: 37.936, name: "Ларино", kind: "town" },
+  { lat: 47.7508, lng: 37.6792, name: "Докучаевск", kind: "town" },
+  { lat: 47.833, lng: 37.66, name: "Еленовка", kind: "town" },
+  { lat: 48.042, lng: 38.147, name: "Харцызск", kind: "town" },
+  { lat: 47.925, lng: 38.202, name: "Иловайск", kind: "town" },
+  { lat: 47.752, lng: 38.03, name: "Старобешево", kind: "town" },
+  { lat: 47.76, lng: 37.59, name: "Новотроицкое", kind: "town" },
+  { lat: 47.924, lng: 37.88, name: "Александровка", kind: "town" },
+];
+
+const initialViewport = readInitialViewport();
+const initialRoute = readInitialRoute();
+const initialSettings = readInitialSettings();
+const initialPlaces = readInitialPlaces();
 
 const state = {
   placing: "A",
-  zoom: 10,
-  center: { lat: 48.015883, lng: 37.80285 },
-  pointA: null,
-  pointB: null,
-  places: [],
+  zoom: initialViewport.zoom,
+  center: initialViewport.center,
+  pointA: initialRoute.pointA,
+  pointB: initialRoute.pointB,
+  places: initialPlaces.length ? initialPlaces : DEFAULT_PLACES,
   placeKey: "",
   placeRequestId: 0,
   placeTimer: null,
@@ -23,6 +52,9 @@ const state = {
   profileKey: "",
   profileRequestId: 0,
   drag: null,
+  saveTimer: null,
+  renderFrame: 0,
+  tileWarmups: new Set(),
 };
 
 const elements = {
@@ -35,7 +67,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260524-final2").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260525-cache3").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -51,12 +83,20 @@ lineLayer.classList.add("plain-line-layer");
 const zoomControl = document.createElement("div");
 zoomControl.className = "plain-zoom";
 zoomControl.innerHTML = '<button type="button" data-zoom="in">+</button><button type="button" data-zoom="out">-</button>';
+const compass = document.createElement("div");
+compass.className = "map-compass";
+compass.setAttribute("aria-label", "Север");
+compass.innerHTML = '<span aria-hidden="true"></span><strong>N</strong>';
 
-elements.map.append(mapLayers, placeLayer, lineLayer, markerLayer, zoomControl);
+elements.map.append(mapLayers, placeLayer, lineLayer, markerLayer, zoomControl, compass);
+elements.heightA.value = initialSettings.heightA;
 
 elements.setA.addEventListener("click", () => setPlacementMode("A"));
 elements.setB.addEventListener("click", () => setPlacementMode("B"));
-document.querySelector("#settings").addEventListener("input", update);
+document.querySelector("#settings").addEventListener("input", () => {
+  saveSettings();
+  update();
+});
 
 zoomControl.addEventListener("click", (event) => {
   const button = event.target.closest("button");
@@ -71,6 +111,8 @@ elements.map.addEventListener("wheel", (event) => {
 
 elements.map.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
+  if (event.target.closest(".plain-zoom")) return;
+  event.preventDefault();
   elements.map.setPointerCapture(event.pointerId);
   state.drag = {
     pointerId: event.pointerId,
@@ -83,22 +125,30 @@ elements.map.addEventListener("pointerdown", (event) => {
 
 elements.map.addEventListener("pointermove", (event) => {
   if (!state.drag || state.drag.pointerId !== event.pointerId) return;
+  event.preventDefault();
   const dx = event.clientX - state.drag.startX;
   const dy = event.clientY - state.drag.startY;
-  if (Math.abs(dx) + Math.abs(dy) > 4) state.drag.moved = true;
+  if (!state.drag.moved && Math.abs(dx) + Math.abs(dy) <= MIN_DRAG_DISTANCE_PX) return;
+  state.drag.moved = true;
   const nextCenterPx = {
     x: state.drag.startCenterPx.x - dx,
     y: state.drag.startCenterPx.y - dy,
   };
   state.center = pixelToLatLng(nextCenterPx, state.zoom);
-  renderMap();
+  scheduleDragOffset(dx, dy);
 });
 
 elements.map.addEventListener("pointerup", (event) => {
   if (!state.drag || state.drag.pointerId !== event.pointerId) return;
   const wasDrag = state.drag.moved;
+  finishDragOffset();
   state.drag = null;
-  if (wasDrag || event.target.closest(".plain-zoom")) return;
+  if (wasDrag) {
+    renderMap();
+    saveViewportSoon();
+    return;
+  }
+  if (event.target.closest(".plain-zoom")) return;
   const point = screenToLatLng(event.clientX, event.clientY);
 
   if (state.placing === "A") {
@@ -107,12 +157,29 @@ elements.map.addEventListener("pointerup", (event) => {
     state.pointB = point;
   }
 
+  saveRoute();
   refreshTerrainProfile();
   update();
   renderMap();
 });
 
-window.addEventListener("resize", renderMap);
+elements.map.addEventListener("pointercancel", () => {
+  if (!state.drag) return;
+  finishDragOffset();
+  state.drag = null;
+  renderMap();
+  saveViewportSoon();
+});
+
+window.addEventListener("resize", () => {
+  renderMap();
+  saveViewportSoon();
+});
+window.addEventListener("beforeunload", () => {
+  saveViewport();
+  saveRoute();
+  saveSettings();
+});
 
 function setPlacementMode(mode) {
   state.placing = mode;
@@ -123,11 +190,21 @@ function setPlacementMode(mode) {
 function setZoom(zoom) {
   state.zoom = Math.max(2, Math.min(18, zoom));
   renderMap();
+  saveViewportSoon();
 }
 
 function renderMap() {
+  if (state.renderFrame) {
+    cancelAnimationFrame(state.renderFrame);
+    state.renderFrame = 0;
+  }
   const rect = elements.map.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
+
+  clearLayerOffset();
+  lineLayer.setAttribute("width", rect.width);
+  lineLayer.setAttribute("height", rect.height);
+  lineLayer.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
 
   const centerPx = latLngToPixel(state.center, state.zoom);
   const topLeft = {
@@ -152,6 +229,7 @@ function renderMap() {
   }
 
   mapLayers.replaceChildren(fragment);
+  restoreCachedPlacesForCurrentView();
   schedulePlaceLoad();
   renderPlaces(topLeft);
   renderMarkersAndLine(topLeft);
@@ -165,7 +243,44 @@ function createTile(z, x, y, left, top) {
   img.draggable = false;
   img.style.transform = `translate(${left}px, ${top}px)`;
   img.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+  warmTileCache(img.src);
   return img;
+}
+
+function scheduleDragOffset(dx, dy) {
+  if (!state.drag) return;
+  state.drag.offsetX = dx;
+  state.drag.offsetY = dy;
+  if (state.drag.raf) return;
+
+  state.drag.raf = requestAnimationFrame(() => {
+    if (!state.drag) return;
+    state.drag.raf = 0;
+    setLayerOffset(state.drag.offsetX || 0, state.drag.offsetY || 0);
+  });
+}
+
+function finishDragOffset() {
+  if (state.drag && state.drag.raf) {
+    cancelAnimationFrame(state.drag.raf);
+    state.drag.raf = 0;
+  }
+  clearLayerOffset();
+}
+
+function setLayerOffset(dx, dy) {
+  const transform = `translate(${Math.round(dx)}px, ${Math.round(dy)}px)`;
+  mapLayers.style.transform = transform;
+  placeLayer.style.transform = transform;
+  lineLayer.style.transform = transform;
+  markerLayer.style.transform = transform;
+}
+
+function clearLayerOffset() {
+  mapLayers.style.transform = "";
+  placeLayer.style.transform = "";
+  lineLayer.style.transform = "";
+  markerLayer.style.transform = "";
 }
 
 function renderPlaces(topLeft) {
@@ -187,29 +302,20 @@ function renderPlaces(topLeft) {
 
 function schedulePlaceLoad() {
   clearTimeout(state.placeTimer);
-  state.placeTimer = setTimeout(loadPlaceLabels, 450);
+  state.placeTimer = setTimeout(loadPlaceLabels, state.places.length ? 180 : 40);
 }
 
 async function loadPlaceLabels() {
-  const bounds = getMapBounds();
-  const placeKinds = getPlaceKindsForZoom(state.zoom);
-  const key = [
-    state.zoom,
-    placeKinds,
-    bounds.south.toFixed(3),
-    bounds.west.toFixed(3),
-    bounds.north.toFixed(3),
-    bounds.east.toFixed(3),
-  ].join(",");
+  const { bounds, placeKinds, key, cacheKey } = getPlaceCacheInfo();
 
   if (key === state.placeKey) return;
   state.placeKey = key;
   const requestId = ++state.placeRequestId;
-  const cacheKey = `places:${key}`;
   const cached = readCache(cacheKey);
   if (cached) {
     state.places = cached;
-    renderMap();
+    writeCache(LAST_PLACES_CACHE_KEY, { key, places: state.places });
+    renderCurrentOverlays();
     return;
   }
 
@@ -233,15 +339,67 @@ async function loadPlaceLabels() {
       }))
       .filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng) && place.name))
       .slice(0, getPlaceLimitForZoom(state.zoom));
-    if (state.places.length > 0) writeCache(cacheKey, state.places);
-    renderMap();
+    if (state.places.length > 0) {
+      writeCache(cacheKey, state.places);
+      writeCache(LAST_PLACES_CACHE_KEY, { key, places: state.places });
+    }
+    renderCurrentOverlays();
   } catch (error) {
     if (requestId !== state.placeRequestId) return;
-    state.places = [];
+    if (!state.places.length) {
+      const last = readCache(LAST_PLACES_CACHE_KEY);
+      state.places = Array.isArray(last && last.places) ? last.places : [];
+    }
     state.placeKey = "";
-    renderMap();
+    renderCurrentOverlays();
     console.error(error);
   }
+}
+
+function restoreCachedPlacesForCurrentView() {
+  const { cacheKey } = getPlaceCacheInfo();
+  const cached = readCache(cacheKey);
+  if (cached) {
+    state.places = cached;
+    return;
+  }
+
+  if (!state.places.length) {
+    const last = readCache(LAST_PLACES_CACHE_KEY);
+    if (last && Array.isArray(last.places)) state.places = last.places;
+  }
+}
+
+function getPlaceCacheInfo() {
+  const bounds = getMapBounds();
+  const placeKinds = getPlaceKindsForZoom(state.zoom);
+  const key = [
+    state.zoom,
+    placeKinds,
+    bounds.south.toFixed(3),
+    bounds.west.toFixed(3),
+    bounds.north.toFixed(3),
+    bounds.east.toFixed(3),
+  ].join(",");
+
+  return {
+    bounds,
+    placeKinds,
+    key,
+    cacheKey: `places:${key}`,
+  };
+}
+
+function renderCurrentOverlays() {
+  const rect = elements.map.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const centerPx = latLngToPixel(state.center, state.zoom);
+  const topLeft = {
+    x: centerPx.x - rect.width / 2,
+    y: centerPx.y - rect.height / 2,
+  };
+  renderPlaces(topLeft);
+  renderMarkersAndLine(topLeft);
 }
 
 function getPlaceKindsForZoom(zoom) {
@@ -400,7 +558,7 @@ function update() {
     : calculateRequiredHeightB(distanceM, params);
 
   elements.distanceOut.textContent = formatDistance(distanceM);
-  elements.commentOut.textContent = buildComment(requiredHeightB);
+  elements.commentOut.textContent = buildComment(requiredHeightB, Boolean(state.profile));
 }
 
 function readParams() {
@@ -412,12 +570,12 @@ function readParams() {
   };
 }
 
-function buildComment(requiredHeightB) {
-  if (!state.profile) {
-    return "Идет загрузка рельефа. До загрузки DEM результат является грубой оценкой по гладкой Земле.";
+function buildComment(requiredHeightB, hasTerrain) {
+  const height = formatCeilMeters(requiredHeightB);
+  if (!hasTerrain) {
+    return `Предварительно без рельефа: над точкой B видео расчетно пропадет ниже ${height} м. Уточняю по рельефу...`;
   }
 
-  const height = formatCeilMeters(requiredHeightB);
   return `Над точкой B видео расчетно пропадет ниже ${height} м над землей. Не опускаться ниже ${height} м.`;
 }
 
@@ -478,22 +636,28 @@ async function refreshTerrainProfile() {
     return;
   }
 
-  const key = [
-    state.pointA.lat.toFixed(6),
-    state.pointA.lng.toFixed(6),
-    state.pointB.lat.toFixed(6),
-    state.pointB.lng.toFixed(6),
-  ].join(",");
+  const key = getProfileKey(state.pointA, state.pointB);
 
   if (key === state.profileKey && state.profile) return;
 
   state.profile = null;
   state.profileKey = key;
   const requestId = ++state.profileRequestId;
-  const cacheKey = `dem:${key}:samples${DEM_SAMPLE_COUNT}`;
+  const cacheKey = getProfileCacheKey(state.pointA, state.pointB);
   const cached = readCache(cacheKey);
   if (cached && Array.isArray(cached.points) && Array.isArray(cached.elevations)) {
     state.profile = cached;
+    update();
+    return;
+  }
+
+  const reverseCached = readCache(getProfileCacheKey(state.pointB, state.pointA));
+  if (reverseCached && Array.isArray(reverseCached.points) && Array.isArray(reverseCached.elevations)) {
+    state.profile = {
+      points: [...reverseCached.points].reverse(),
+      elevations: [...reverseCached.elevations].reverse(),
+    };
+    writeCache(cacheKey, state.profile);
     update();
     return;
   }
@@ -517,6 +681,19 @@ async function refreshTerrainProfile() {
     elements.commentOut.textContent = "Не удалось загрузить профиль рельефа. Проверьте интернет или повторно поставьте точку B.";
     console.error(error);
   }
+}
+
+function getProfileKey(pointA, pointB) {
+  return [
+    pointA.lat.toFixed(4),
+    pointA.lng.toFixed(4),
+    pointB.lat.toFixed(4),
+    pointB.lng.toFixed(4),
+  ].join(",");
+}
+
+function getProfileCacheKey(pointA, pointB) {
+  return `dem:${getProfileKey(pointA, pointB)}:samples${DEM_SAMPLE_COUNT}`;
 }
 
 function readCache(key) {
@@ -556,13 +733,115 @@ function pruneCache() {
   keys.slice(0, Math.ceil(keys.length / 2)).forEach((key) => localStorage.removeItem(key));
 }
 
-async function fetchElevationProfile(points) {
-  const elevations = [];
-  const chunkSize = 20;
+function readInitialViewport() {
+  const saved = readCache(VIEWPORT_CACHE_KEY);
+  if (
+    saved &&
+    Number.isFinite(saved.zoom) &&
+    isLatLng(saved.center)
+  ) {
+    return {
+      zoom: Math.max(2, Math.min(18, Math.round(saved.zoom))),
+      center: saved.center,
+    };
+  }
 
-  for (let index = 0; index < points.length; index += chunkSize) {
-    const chunk = points.slice(index, index + chunkSize);
-    const data = await fetchElevationChunk(chunk);
+  return DEFAULT_VIEWPORT;
+}
+
+function readInitialRoute() {
+  const saved = readCache(ROUTE_CACHE_KEY);
+  return {
+    pointA: saved && isLatLng(saved.pointA) ? saved.pointA : null,
+    pointB: saved && isLatLng(saved.pointB) ? saved.pointB : null,
+  };
+}
+
+function readInitialSettings() {
+  const saved = readCache(SETTINGS_CACHE_KEY);
+  return {
+    heightA: saved && Number.isFinite(Number(saved.heightA)) ? String(saved.heightA) : "2",
+  };
+}
+
+function readInitialPlaces() {
+  const saved = readCache(LAST_PLACES_CACHE_KEY);
+  return saved && Array.isArray(saved.places) ? saved.places : [];
+}
+
+function isLatLng(point) {
+  return point &&
+    Number.isFinite(point.lat) &&
+    Number.isFinite(point.lng) &&
+    point.lat >= -85 &&
+    point.lat <= 85 &&
+    point.lng >= -180 &&
+    point.lng <= 180;
+}
+
+function saveViewportSoon() {
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(saveViewport, 250);
+}
+
+function saveViewport() {
+  writeCache(VIEWPORT_CACHE_KEY, {
+    zoom: state.zoom,
+    center: state.center,
+  });
+}
+
+function saveRoute() {
+  writeCache(ROUTE_CACHE_KEY, {
+    pointA: state.pointA,
+    pointB: state.pointB,
+  });
+}
+
+function saveSettings() {
+  writeCache(SETTINGS_CACHE_KEY, {
+    heightA: elements.heightA.value,
+  });
+}
+
+function warmTileCache(url) {
+  if (!("caches" in window) || !url) return;
+  if (state.tileWarmups.has(url)) return;
+  if (state.tileWarmups.size > 2000) state.tileWarmups.clear();
+  state.tileWarmups.add(url);
+
+  const run = async () => {
+    try {
+      const cache = await caches.open(TILE_RUNTIME_CACHE);
+      const cached = await cache.match(url);
+      if (cached) return;
+      const response = await fetch(url, { mode: "no-cors", cache: "force-cache" });
+      if (response.ok || response.type === "opaque") {
+        await cache.put(url, response.clone());
+      }
+    } catch {
+      // Service worker caching still covers normal online use; this is only a first-run warmup.
+    }
+  };
+
+  if ("requestIdleCallback" in window) {
+    requestIdleCallback(run, { timeout: 2000 });
+  } else {
+    setTimeout(run, 0);
+  }
+}
+
+async function fetchElevationProfile(points) {
+  const chunks = [];
+
+  for (let index = 0; index < points.length; index += DEM_CHUNK_SIZE) {
+    chunks.push(points.slice(index, index + DEM_CHUNK_SIZE));
+  }
+
+  const elevations = [];
+  const results = await Promise.all(chunks.map((chunk) => fetchElevationChunk(chunk)));
+
+  for (const data of results) {
     if (!Array.isArray(data.elevation)) {
       throw new Error("Elevation API returned no elevation array");
     }
@@ -677,3 +956,4 @@ function formatCeilMeters(meters) {
 
 renderMap();
 update();
+if (state.pointA && state.pointB) refreshTerrainProfile();

@@ -1,7 +1,7 @@
-const STATIC_CACHE = "radiovidimost-static-v5";
+const STATIC_CACHE = "radiovidimost-static-v8";
 const TILE_CACHE = "radiovidimost-tiles-v1";
 const DATA_CACHE = "radiovidimost-data-v2";
-const STATIC_ASSETS = ["./index.html", "./styles.css", "./app.js?v=20260524-final2", "./sw.js?v=20260524-final2"];
+const STATIC_ASSETS = ["./index.html", "./styles.css", "./app.js?v=20260525-cache3", "./sw.js?v=20260525-cache3"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -35,7 +35,7 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (url.hostname === "api.open-meteo.com" || url.hostname.includes("overpass") || url.hostname === "query.wikidata.org") {
-    event.respondWith(networkFirst(request, DATA_CACHE));
+    event.respondWith(cacheFirst(request, DATA_CACHE));
     return;
   }
 
