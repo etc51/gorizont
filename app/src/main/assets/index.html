@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Горизонт</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="map-panel" aria-label="Карта">
+        <div id="map"></div>
+      </section>
+
+      <aside class="control-panel" aria-label="Параметры расчета">
+        <header>
+          <p class="eyebrow">Гражданский RF-калькулятор</p>
+          <h1>Горизонт</h1>
+        </header>
+
+        <section class="note result-note" aria-label="Комментарий к расчету">
+          <p id="commentOut">
+            Поставьте точки A и B на карте. Выберите кнопку A или B, затем кликните по карте для переноса точки.
+          </p>
+        </section>
+
+        <form id="settings" class="settings">
+          <div class="mode-switch" aria-label="Выбор точки">
+            <button id="setA" class="active" type="button">Точка A</button>
+            <button id="setB" type="button">Точка B</button>
+          </div>
+        </form>
+
+        <section class="status-grid" aria-label="Итоги">
+          <div>
+            <span>Дистанция</span>
+            <strong id="distanceOut">-</strong>
+          </div>
+          <div>
+            <label class="inline-card-input">
+              <span>Высота антенны A, м</span>
+              <input id="heightA" type="number" min="0" step="0.1" value="2" />
+            </label>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <script src="./app.js?v=20260524-final2"></script>
+  </body>
+</html>
