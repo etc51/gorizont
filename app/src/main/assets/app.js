@@ -7,6 +7,7 @@ const DEFAULT_K_FACTOR = 1.33;
 const EDGE_IGNORE_RATIO = 0.1;
 const DEM_SAMPLE_COUNT = 60;
 const DEM_CHUNK_SIZE = 60;
+const PAN_SPEED_MULTIPLIER = 3;
 const CACHE_PREFIX = "rf-calc-cache-v2:";
 const CACHE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 const TILE_RUNTIME_CACHE = "radiovidimost-tiles-v1";
@@ -15,6 +16,8 @@ const VIEWPORT_CACHE_KEY = "viewport";
 const ROUTE_CACHE_KEY = "route";
 const SETTINGS_CACHE_KEY = "settings";
 const LAST_PLACES_CACHE_KEY = "places:last";
+const PLACE_BANK_CACHE_KEY = "places:bank";
+const MAX_PLACE_BANK_SIZE = 5000;
 const PLACE_KIND_WEIGHT = {
   city: 0,
   town: 1,
@@ -45,6 +48,7 @@ const initialViewport = readInitialViewport();
 const initialRoute = readInitialRoute();
 const initialSettings = readInitialSettings();
 const initialPlaces = readInitialPlaces();
+const initialPlaceBank = mergePlaces(DEFAULT_PLACES, readInitialPlaceBank(), initialPlaces);
 
 const state = {
   placing: "A",
@@ -52,7 +56,8 @@ const state = {
   center: initialViewport.center,
   pointA: initialRoute.pointA,
   pointB: initialRoute.pointB,
-  places: initialPlaces.length ? initialPlaces : DEFAULT_PLACES,
+  places: initialPlaces.length ? mergePlaces(initialPlaces, DEFAULT_PLACES) : DEFAULT_PLACES,
+  placeBank: initialPlaceBank,
   placeKey: "",
   placeRequestId: 0,
   placeTimer: null,
@@ -66,6 +71,7 @@ const state = {
   tileWarmupQueue: [],
   tileWarmupActive: 0,
 };
+writeCache(PLACE_BANK_CACHE_KEY, state.placeBank);
 
 const elements = {
   map: document.querySelector("#map"),
@@ -77,7 +83,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260525-cache6").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260525-cache7").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -140,12 +146,14 @@ elements.map.addEventListener("pointermove", (event) => {
   const dy = event.clientY - state.drag.startY;
   if (!state.drag.moved && Math.abs(dx) + Math.abs(dy) <= MIN_DRAG_DISTANCE_PX) return;
   state.drag.moved = true;
+  const mapDx = dx * PAN_SPEED_MULTIPLIER;
+  const mapDy = dy * PAN_SPEED_MULTIPLIER;
   const nextCenterPx = {
-    x: state.drag.startCenterPx.x - dx,
-    y: state.drag.startCenterPx.y - dy,
+    x: state.drag.startCenterPx.x - mapDx,
+    y: state.drag.startCenterPx.y - mapDy,
   };
   state.center = pixelToLatLng(nextCenterPx, state.zoom);
-  scheduleDragOffset(dx, dy);
+  scheduleDragOffset(mapDx, mapDy);
 });
 
 elements.map.addEventListener("pointerup", (event) => {
@@ -324,7 +332,7 @@ function renderPlaces(topLeft) {
 
 function schedulePlaceLoad() {
   clearTimeout(state.placeTimer);
-  state.placeTimer = setTimeout(loadPlaceLabels, state.places.length ? 180 : 40);
+  state.placeTimer = setTimeout(loadPlaceLabels, state.places.length ? 80 : 20);
 }
 
 async function loadPlaceLabels() {
@@ -335,7 +343,8 @@ async function loadPlaceLabels() {
   const requestId = ++state.placeRequestId;
   const cached = readCache(cacheKey);
   if (cached) {
-    state.places = cached;
+    rememberPlaces(cached);
+    state.places = getStoredPlacesForBounds(bounds);
     writeCache(LAST_PLACES_CACHE_KEY, { key, places: state.places });
     renderCurrentOverlays();
     return;
@@ -352,7 +361,7 @@ async function loadPlaceLabels() {
     const data = await fetchPlaceData(query, bounds);
     if (requestId !== state.placeRequestId) return;
 
-    state.places = uniquePlaces((data.elements || [])
+    const loadedPlaces = uniquePlaces((data.elements || [])
       .map((item) => ({
         lat: item.lat,
         lng: item.lon,
@@ -362,8 +371,10 @@ async function loadPlaceLabels() {
       .filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng) && place.name))
       .sort(comparePlaces)
       .slice(0, getPlaceLimitForZoom(state.zoom));
-    if (state.places.length > 0) {
-      writeCache(cacheKey, state.places);
+    if (loadedPlaces.length > 0) {
+      rememberPlaces(loadedPlaces);
+      state.places = getStoredPlacesForBounds(bounds);
+      writeCache(cacheKey, loadedPlaces);
       writeCache(LAST_PLACES_CACHE_KEY, { key, places: state.places });
     }
     renderCurrentOverlays();
@@ -380,10 +391,16 @@ async function loadPlaceLabels() {
 }
 
 function restoreCachedPlacesForCurrentView() {
-  const { cacheKey } = getPlaceCacheInfo();
+  const { bounds, cacheKey } = getPlaceCacheInfo();
+  const stored = getStoredPlacesForBounds(bounds);
+  if (stored.length) {
+    state.places = stored;
+  }
+
   const cached = readCache(cacheKey);
   if (cached) {
-    state.places = cached;
+    rememberPlaces(cached);
+    state.places = getStoredPlacesForBounds(bounds);
     return;
   }
 
@@ -411,6 +428,26 @@ function getPlaceCacheInfo() {
     key,
     cacheKey: `places:${key}`,
   };
+}
+
+function getStoredPlacesForBounds(bounds) {
+  return state.placeBank
+    .filter((place) => isPlaceInsideBounds(place, bounds))
+    .sort(comparePlaces)
+    .slice(0, getPlaceLimitForZoom(state.zoom));
+}
+
+function isPlaceInsideBounds(place, bounds) {
+  return place.lat >= bounds.south &&
+    place.lat <= bounds.north &&
+    place.lng >= bounds.west &&
+    place.lng <= bounds.east;
+}
+
+function rememberPlaces(places) {
+  if (!Array.isArray(places) || !places.length) return;
+  state.placeBank = mergePlaces(places, state.placeBank).slice(0, MAX_PLACE_BANK_SIZE);
+  writeCache(PLACE_BANK_CACHE_KEY, state.placeBank);
 }
 
 function renderCurrentOverlays() {
@@ -473,6 +510,41 @@ function cleanPlaceName(name) {
   return name.replace(/\s*\(.+?\)\s*/g, "").trim();
 }
 
+function mergePlaces(...groups) {
+  const seen = new Set();
+  const result = [];
+
+  for (const group of groups) {
+    if (!Array.isArray(group)) continue;
+    for (const place of group) {
+      const normalized = normalizePlace(place);
+      if (!normalized) continue;
+      const key = [
+        normalized.name.toLowerCase(),
+        normalized.lat.toFixed(3),
+        normalized.lng.toFixed(3),
+      ].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(normalized);
+    }
+  }
+
+  return result;
+}
+
+function normalizePlace(place) {
+  if (!place) return null;
+  const normalized = {
+    lat: Number(place.lat),
+    lng: Number(place.lng),
+    name: cleanPlaceName(place.name),
+    kind: place.kind || "settlement",
+  };
+  if (!Number.isFinite(normalized.lat) || !Number.isFinite(normalized.lng) || !normalized.name) return null;
+  return normalized;
+}
+
 function uniquePlaces(places) {
   const seen = new Set();
   return places.filter((place) => {
@@ -505,17 +577,20 @@ async function fetchOverpass(query) {
     "https://overpass.kumi.systems/api/interpreter",
   ];
 
-  for (const endpoint of endpoints) {
+  const requests = endpoints.map(async (endpoint) => {
     const url = `${endpoint}?${new URLSearchParams({ data: query })}`;
-    try {
-      const response = await fetchWithTimeout(url, 8000);
-      if (!response.ok) throw new Error(`Overpass returned ${response.status}`);
-      return await response.json();
-    } catch (error) {
-      if (endpoint === endpoints[endpoints.length - 1]) throw error;
-    }
+    const response = await fetchWithTimeout(url, 6500);
+    if (!response.ok) throw new Error(`Overpass returned ${response.status}`);
+    return await response.json();
+  });
+
+  if (Promise.any) {
+    return await Promise.any(requests);
   }
 
+  const results = await Promise.allSettled(requests);
+  const firstSuccess = results.find((result) => result.status === "fulfilled");
+  if (firstSuccess) return firstSuccess.value;
   throw new Error("Overpass request failed");
 }
 
@@ -791,6 +866,7 @@ function pruneCache() {
     CACHE_PREFIX + ROUTE_CACHE_KEY,
     CACHE_PREFIX + SETTINGS_CACHE_KEY,
     CACHE_PREFIX + LAST_PLACES_CACHE_KEY,
+    CACHE_PREFIX + PLACE_BANK_CACHE_KEY,
   ]);
   const entries = [];
   for (let i = 0; i < localStorage.length; i += 1) {
@@ -845,6 +921,11 @@ function readInitialSettings() {
 function readInitialPlaces() {
   const saved = readCache(LAST_PLACES_CACHE_KEY);
   return saved && Array.isArray(saved.places) ? saved.places : [];
+}
+
+function readInitialPlaceBank() {
+  const saved = readCache(PLACE_BANK_CACHE_KEY);
+  return Array.isArray(saved) ? saved : [];
 }
 
 function isLatLng(point) {
