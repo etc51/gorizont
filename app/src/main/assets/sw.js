@@ -1,7 +1,7 @@
-const STATIC_CACHE = "radiovidimost-static-v15";
+const STATIC_CACHE = "radiovidimost-static-v17";
 const TILE_CACHE = "radiovidimost-tiles-v1";
 const DATA_CACHE = "radiovidimost-data-v2";
-const STATIC_ASSETS = ["./index.html", "./styles.css", "./app.js?v=20260526-cache10", "./sw.js?v=20260526-cache10"];
+const STATIC_ASSETS = ["./index.html", "./styles.css", "./app.js?v=20260526-cache12", "./sw.js?v=20260526-cache12"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

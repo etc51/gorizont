@@ -8,6 +8,8 @@ const EDGE_IGNORE_RATIO = 0.1;
 const DEM_SAMPLE_COUNT = 60;
 const DEM_CHUNK_SIZE = 60;
 const PAN_SPEED_MULTIPLIER = 3;
+const TILE_PRELOAD_DELAY_MS = 350;
+const MAX_RETAINED_TILES = 128;
 const CACHE_PREFIX = "rf-calc-cache-v2:";
 const CACHE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 const TILE_RUNTIME_CACHE = "radiovidimost-tiles-v1";
@@ -70,6 +72,9 @@ const state = {
   pinch: null,
   saveTimer: null,
   renderFrame: 0,
+  tiles: new Map(),
+  tileSerial: 0,
+  tilePreloadTimer: null,
   tileWarmups: new Set(),
   tileWarmupQueue: [],
   tileWarmupActive: 0,
@@ -86,7 +91,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260526-cache10").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260526-cache12").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -381,12 +386,13 @@ function renderMap() {
     x: centerPx.x - rect.width / 2,
     y: centerPx.y - rect.height / 2,
   };
-  const minTileX = Math.floor(topLeft.x / TILE_SIZE) - 1;
-  const minTileY = Math.floor(topLeft.y / TILE_SIZE) - 1;
-  const maxTileX = Math.floor((topLeft.x + rect.width) / TILE_SIZE) + 1;
-  const maxTileY = Math.floor((topLeft.y + rect.height) / TILE_SIZE) + 1;
+  const minTileX = Math.floor(topLeft.x / TILE_SIZE);
+  const minTileY = Math.floor(topLeft.y / TILE_SIZE);
+  const maxTileX = Math.floor((topLeft.x + rect.width) / TILE_SIZE);
+  const maxTileY = Math.floor((topLeft.y + rect.height) / TILE_SIZE);
   const worldTiles = 2 ** state.zoom;
-  const fragment = document.createDocumentFragment();
+  const activeTileKeys = new Set();
+  const visibleTiles = [];
 
   for (let x = minTileX; x <= maxTileX; x += 1) {
     for (let y = minTileY; y <= maxTileY; y += 1) {
@@ -394,27 +400,113 @@ function renderMap() {
       const wrappedX = ((x % worldTiles) + worldTiles) % worldTiles;
       const left = Math.round(x * TILE_SIZE - topLeft.x);
       const top = Math.round(y * TILE_SIZE - topLeft.y);
-      fragment.append(createTile(state.zoom, wrappedX, y, left, top));
+      const key = getTileKey(state.zoom, wrappedX, y);
+      activeTileKeys.add(key);
+      visibleTiles.push({
+        z: state.zoom,
+        x: wrappedX,
+        y,
+        left,
+        top,
+        key,
+        distance: Math.hypot(
+          left + TILE_SIZE / 2 - rect.width / 2,
+          top + TILE_SIZE / 2 - rect.height / 2,
+        ),
+      });
     }
   }
 
-  mapLayers.replaceChildren(fragment);
+  visibleTiles
+    .sort((a, b) => a.distance - b.distance)
+    .forEach((tile) => placeTile(tile.z, tile.x, tile.y, tile.left, tile.top, tile.key));
+
+  parkUnusedTiles(activeTileKeys);
+  scheduleNeighborTilePreload(state.zoom, minTileX, minTileY, maxTileX, maxTileY, worldTiles);
   restoreCachedPlacesForCurrentView();
   schedulePlaceLoad();
   renderPlaces(topLeft);
   renderMarkersAndLine(topLeft);
 }
 
-function createTile(z, x, y, left, top) {
+function placeTile(z, x, y, left, top, key = getTileKey(z, x, y)) {
+  let img = state.tiles.get(key);
+  if (!img) {
+    img = createTile(z, x, y);
+    state.tiles.set(key, img);
+    mapLayers.append(img);
+  }
+  img.hidden = false;
+  img.dataset.active = "1";
+  img.dataset.lastUsed = String(++state.tileSerial);
+  img.style.transform = `translate(${left}px, ${top}px)`;
+}
+
+function createTile(z, x, y) {
   const img = document.createElement("img");
   img.className = "plain-tile";
   img.alt = "";
   img.decoding = "async";
+  img.loading = "eager";
   img.draggable = false;
-  img.style.transform = `translate(${left}px, ${top}px)`;
-  img.src = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-  warmTileCache(img.src);
+  img.setAttribute("fetchpriority", "high");
+  img.addEventListener("load", () => warmTileCache(img.currentSrc || img.src), { once: true });
+  img.src = getTileUrl(z, x, y);
   return img;
+}
+
+function parkUnusedTiles(activeTileKeys) {
+  for (const [key, img] of state.tiles) {
+    if (activeTileKeys.has(key)) continue;
+    img.hidden = true;
+    img.dataset.active = "0";
+  }
+
+  if (state.tiles.size <= MAX_RETAINED_TILES) return;
+  const unusedTiles = Array.from(state.tiles.entries())
+    .filter(([, img]) => img.dataset.active !== "1")
+    .sort(([, a], [, b]) => Number(a.dataset.lastUsed || 0) - Number(b.dataset.lastUsed || 0));
+  const removeCount = state.tiles.size - MAX_RETAINED_TILES;
+  unusedTiles.slice(0, removeCount).forEach(([key, img]) => {
+    img.remove();
+    state.tiles.delete(key);
+  });
+}
+
+function scheduleNeighborTilePreload(zoom, minTileX, minTileY, maxTileX, maxTileY, worldTiles) {
+  clearTimeout(state.tilePreloadTimer);
+  state.tilePreloadTimer = setTimeout(() => {
+    const preload = [];
+    for (let x = minTileX - 1; x <= maxTileX + 1; x += 1) {
+      for (let y = minTileY - 1; y <= maxTileY + 1; y += 1) {
+        if (y < 0 || y >= worldTiles) continue;
+        if (x >= minTileX && x <= maxTileX && y >= minTileY && y <= maxTileY) continue;
+        const wrappedX = ((x % worldTiles) + worldTiles) % worldTiles;
+        preload.push({
+          url: getTileUrl(zoom, wrappedX, y),
+          distance: Math.min(
+            Math.abs(x - minTileX),
+            Math.abs(x - maxTileX),
+          ) + Math.min(
+            Math.abs(y - minTileY),
+            Math.abs(y - maxTileY),
+          ),
+        });
+      }
+    }
+    preload
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, 32)
+      .forEach((tile) => warmTileCache(tile.url));
+  }, TILE_PRELOAD_DELAY_MS);
+}
+
+function getTileKey(z, x, y) {
+  return `${z}/${x}/${y}`;
+}
+
+function getTileUrl(z, x, y) {
+  return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
 }
 
 function scheduleDragOffset(dx, dy) {
@@ -1115,7 +1207,6 @@ function saveSettings() {
 
 function warmTileCache(url) {
   if (!("caches" in window) || !url) return;
-  if (navigator.serviceWorker && navigator.serviceWorker.controller) return;
   if (state.tileWarmups.has(url)) return;
   if (state.tileWarmups.size > 2000) state.tileWarmups.clear();
   state.tileWarmups.add(url);
