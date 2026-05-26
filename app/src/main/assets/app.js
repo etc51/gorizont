@@ -27,6 +27,7 @@ const PLACE_KIND_WEIGHT = {
   hamlet: 4,
 };
 const MIN_DRAG_DISTANCE_PX = 4;
+const PINCH_ZOOM_STEP_RATIO = 1.18;
 const DEFAULT_PLACES = [
   { lat: 48.0028, lng: 37.8053, name: "Донецк", kind: "city" },
   { lat: 48.0478, lng: 37.9258, name: "Макеевка", kind: "city" },
@@ -64,7 +65,9 @@ const state = {
   profile: null,
   profileKey: "",
   profileRequestId: 0,
+  pointers: new Map(),
   drag: null,
+  pinch: null,
   saveTimer: null,
   renderFrame: 0,
   tileWarmups: new Set(),
@@ -83,7 +86,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260525-cache7").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260526-cache10").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -114,22 +117,42 @@ document.querySelector("#settings").addEventListener("input", () => {
   update();
 });
 
-zoomControl.addEventListener("click", (event) => {
+zoomControl.addEventListener("pointerdown", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
   setZoom(state.zoom + (button.dataset.zoom === "in" ? 1 : -1));
+});
+
+zoomControl.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
 });
 
 elements.map.addEventListener("wheel", (event) => {
   event.preventDefault();
-  setZoom(state.zoom + (event.deltaY < 0 ? 1 : -1));
+  setZoom(state.zoom + (event.deltaY < 0 ? 1 : -1), event.clientX, event.clientY);
 }, { passive: false });
 
 elements.map.addEventListener("pointerdown", (event) => {
   if (event.button !== 0) return;
   if (event.target.closest(".plain-zoom")) return;
   event.preventDefault();
-  elements.map.setPointerCapture(event.pointerId);
+  try {
+    elements.map.setPointerCapture(event.pointerId);
+  } catch {
+    // Pointer capture is best effort in older Android WebView builds.
+  }
+  state.pointers.set(event.pointerId, getPointerPosition(event));
+
+  if (state.pointers.size >= 2) {
+    finishDragOffset();
+    state.drag = null;
+    startPinch();
+    return;
+  }
+
   state.drag = {
     pointerId: event.pointerId,
     startX: event.clientX,
@@ -140,8 +163,18 @@ elements.map.addEventListener("pointerdown", (event) => {
 });
 
 elements.map.addEventListener("pointermove", (event) => {
-  if (!state.drag || state.drag.pointerId !== event.pointerId) return;
+  if (!state.pointers.has(event.pointerId)) return;
   event.preventDefault();
+
+  state.pointers.set(event.pointerId, getPointerPosition(event));
+
+  if (state.pinch && state.pointers.size >= 2) {
+    updatePinch();
+    return;
+  }
+
+  if (!state.drag || state.drag.pointerId !== event.pointerId) return;
+
   const dx = event.clientX - state.drag.startX;
   const dy = event.clientY - state.drag.startY;
   if (!state.drag.moved && Math.abs(dx) + Math.abs(dy) <= MIN_DRAG_DISTANCE_PX) return;
@@ -157,8 +190,21 @@ elements.map.addEventListener("pointermove", (event) => {
 });
 
 elements.map.addEventListener("pointerup", (event) => {
-  if (!state.drag || state.drag.pointerId !== event.pointerId) return;
-  const wasDrag = state.drag.moved;
+  if (!state.pointers.has(event.pointerId)) return;
+  event.preventDefault();
+
+  const wasPinch = Boolean(state.pinch);
+  const wasDrag = Boolean(state.drag && state.drag.pointerId === event.pointerId && state.drag.moved);
+  const wasTap = Boolean(state.drag && state.drag.pointerId === event.pointerId && !state.drag.moved);
+  state.pointers.delete(event.pointerId);
+
+  if (wasPinch) {
+    endPinch();
+    return;
+  }
+
+  if (!wasTap && !wasDrag) return;
+
   finishDragOffset();
   state.drag = null;
   if (wasDrag) {
@@ -181,12 +227,18 @@ elements.map.addEventListener("pointerup", (event) => {
   renderMap();
 });
 
-elements.map.addEventListener("pointercancel", () => {
-  if (!state.drag) return;
-  finishDragOffset();
-  state.drag = null;
-  renderMap();
-  saveViewportSoon();
+elements.map.addEventListener("pointercancel", (event) => {
+  state.pointers.delete(event.pointerId);
+  if (state.pinch) {
+    endPinch();
+    return;
+  }
+  if (state.drag && state.drag.pointerId === event.pointerId) {
+    finishDragOffset();
+    state.drag = null;
+    renderMap();
+    saveViewportSoon();
+  }
 });
 
 window.addEventListener("resize", () => {
@@ -205,10 +257,110 @@ function setPlacementMode(mode) {
   elements.setB.classList.toggle("active", mode === "B");
 }
 
-function setZoom(zoom) {
-  state.zoom = Math.max(2, Math.min(18, zoom));
+function setZoom(zoom, focusClientX, focusClientY) {
+  const nextZoom = clampZoom(zoom);
+  if (nextZoom === state.zoom) return;
+
+  const hasFocus = Number.isFinite(focusClientX) && Number.isFinite(focusClientY);
+  const focusPoint = hasFocus ? screenToLatLng(focusClientX, focusClientY) : null;
+
+  state.zoom = nextZoom;
+  if (focusPoint) {
+    keepPointUnderScreenPosition(focusPoint, focusClientX, focusClientY);
+  }
+
   renderMap();
   saveViewportSoon();
+}
+
+function clampZoom(zoom) {
+  return Math.max(2, Math.min(18, Math.round(zoom)));
+}
+
+function keepPointUnderScreenPosition(point, clientX, clientY) {
+  const rect = elements.map.getBoundingClientRect();
+  const pointPx = latLngToPixel(point, state.zoom);
+  const centerPx = {
+    x: pointPx.x - (clientX - rect.left) + rect.width / 2,
+    y: pointPx.y - (clientY - rect.top) + rect.height / 2,
+  };
+  state.center = pixelToLatLng(centerPx, state.zoom);
+}
+
+function getPointerPosition(event) {
+  return {
+    id: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+  };
+}
+
+function startPinch() {
+  const points = getPinchPoints();
+  if (points.length < 2) return;
+  state.pinch = {
+    startDistance: getPointDistance(points[0], points[1]),
+    changed: false,
+  };
+}
+
+function updatePinch() {
+  const points = getPinchPoints();
+  if (points.length < 2) return;
+  if (!state.pinch) startPinch();
+  if (!state.pinch || state.pinch.startDistance <= 0) return;
+
+  const distance = getPointDistance(points[0], points[1]);
+  if (distance <= 0) return;
+
+  const ratio = distance / state.pinch.startDistance;
+  if (ratio < PINCH_ZOOM_STEP_RATIO && ratio > 1 / PINCH_ZOOM_STEP_RATIO) return;
+
+  const midpoint = getPointMidpoint(points[0], points[1]);
+  const direction = ratio > 1 ? 1 : -1;
+  const previousZoom = state.zoom;
+  setZoom(state.zoom + direction, midpoint.x, midpoint.y);
+
+  state.pinch.startDistance = distance;
+  if (state.zoom !== previousZoom) state.pinch.changed = true;
+}
+
+function endPinch() {
+  const changed = Boolean(state.pinch && state.pinch.changed);
+  state.pinch = null;
+  finishDragOffset();
+  state.drag = null;
+
+  const remaining = getPinchPoints()[0];
+  if (remaining) {
+    state.drag = {
+      pointerId: remaining.id,
+      startX: remaining.x,
+      startY: remaining.y,
+      startCenterPx: latLngToPixel(state.center, state.zoom),
+      moved: true,
+    };
+  }
+
+  if (changed) {
+    renderMap();
+    saveViewportSoon();
+  }
+}
+
+function getPinchPoints() {
+  return Array.from(state.pointers.values()).slice(0, 2);
+}
+
+function getPointDistance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function getPointMidpoint(a, b) {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+  };
 }
 
 function renderMap() {
@@ -431,8 +583,7 @@ function getPlaceCacheInfo() {
 }
 
 function getStoredPlacesForBounds(bounds) {
-  return state.placeBank
-    .filter((place) => isPlaceInsideBounds(place, bounds))
+  return uniquePlaces(state.placeBank.filter((place) => isPlaceInsideBounds(place, bounds)))
     .sort(comparePlaces)
     .slice(0, getPlaceLimitForZoom(state.zoom));
 }
@@ -566,7 +717,6 @@ async function fetchPlaceData(overpassQuery, bounds) {
   try {
     return await fetchOverpass(overpassQuery);
   } catch (error) {
-    console.error(error);
     return await fetchWikidataPlaces(bounds);
   }
 }
