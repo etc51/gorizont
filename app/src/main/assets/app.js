@@ -12,6 +12,8 @@ const TILE_PRELOAD_DELAY_MS = 750;
 const TILE_PRELOAD_LIMIT = 16;
 const TILE_WARMUP_CONCURRENCY = 1;
 const MAX_RETAINED_TILES = 128;
+const USE_NATIVE_TOUCH_EVENTS = typeof window !== "undefined" &&
+  ("ontouchstart" in window || (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0));
 const CACHE_PREFIX = "rf-calc-cache-v2:";
 const CACHE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 const TILE_RUNTIME_CACHE = "radiovidimost-tiles-v1";
@@ -31,7 +33,7 @@ const PLACE_KIND_WEIGHT = {
   hamlet: 4,
 };
 const MIN_DRAG_DISTANCE_PX = 4;
-const PINCH_ZOOM_STEP_RATIO = 1.18;
+const PINCH_ZOOM_STEP_RATIO = 1.08;
 const DEFAULT_PLACES = [
   { lat: 48.0028, lng: 37.8053, name: "Донецк", kind: "city" },
   { lat: 48.0478, lng: 37.9258, name: "Макеевка", kind: "city" },
@@ -72,6 +74,7 @@ const state = {
   pointers: new Map(),
   drag: null,
   pinch: null,
+  touch: null,
   saveTimer: null,
   renderFrame: 0,
   tiles: new Map(),
@@ -93,7 +96,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260527-cache13").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260527-cache14").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -143,6 +146,7 @@ elements.map.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 elements.map.addEventListener("pointerdown", (event) => {
+  if (shouldIgnorePointerTouch(event)) return;
   if (event.button !== 0) return;
   if (event.target.closest(".plain-zoom")) return;
   event.preventDefault();
@@ -170,6 +174,7 @@ elements.map.addEventListener("pointerdown", (event) => {
 });
 
 elements.map.addEventListener("pointermove", (event) => {
+  if (shouldIgnorePointerTouch(event)) return;
   if (!state.pointers.has(event.pointerId)) return;
   event.preventDefault();
 
@@ -186,17 +191,11 @@ elements.map.addEventListener("pointermove", (event) => {
   const dy = event.clientY - state.drag.startY;
   if (!state.drag.moved && Math.abs(dx) + Math.abs(dy) <= MIN_DRAG_DISTANCE_PX) return;
   state.drag.moved = true;
-  const mapDx = dx * PAN_SPEED_MULTIPLIER;
-  const mapDy = dy * PAN_SPEED_MULTIPLIER;
-  const nextCenterPx = {
-    x: state.drag.startCenterPx.x - mapDx,
-    y: state.drag.startCenterPx.y - mapDy,
-  };
-  state.center = pixelToLatLng(nextCenterPx, state.zoom);
-  scheduleDragOffset(mapDx, mapDy);
+  moveMapFromDrag(state.drag.startCenterPx, dx, dy);
 });
 
 elements.map.addEventListener("pointerup", (event) => {
+  if (shouldIgnorePointerTouch(event)) return;
   if (!state.pointers.has(event.pointerId)) return;
   event.preventDefault();
 
@@ -220,21 +219,11 @@ elements.map.addEventListener("pointerup", (event) => {
     return;
   }
   if (event.target.closest(".plain-zoom")) return;
-  const point = screenToLatLng(event.clientX, event.clientY);
-
-  if (state.placing === "A") {
-    state.pointA = point;
-  } else {
-    state.pointB = point;
-  }
-
-  saveRoute();
-  refreshTerrainProfile();
-  update();
-  renderMap();
+  placeSelectedPoint(event.clientX, event.clientY);
 });
 
 elements.map.addEventListener("pointercancel", (event) => {
+  if (shouldIgnorePointerTouch(event)) return;
   state.pointers.delete(event.pointerId);
   if (state.pinch) {
     endPinch();
@@ -247,6 +236,11 @@ elements.map.addEventListener("pointercancel", (event) => {
     saveViewportSoon();
   }
 });
+
+elements.map.addEventListener("touchstart", handleMapTouchStart, { passive: false });
+elements.map.addEventListener("touchmove", handleMapTouchMove, { passive: false });
+elements.map.addEventListener("touchend", handleMapTouchEnd, { passive: false });
+elements.map.addEventListener("touchcancel", handleMapTouchCancel, { passive: false });
 
 window.addEventListener("resize", () => {
   renderMap();
@@ -262,6 +256,122 @@ function setPlacementMode(mode) {
   state.placing = mode;
   elements.setA.classList.toggle("active", mode === "A");
   elements.setB.classList.toggle("active", mode === "B");
+}
+
+function shouldIgnorePointerTouch(event) {
+  return USE_NATIVE_TOUCH_EVENTS && event.pointerType === "touch";
+}
+
+function handleMapTouchStart(event) {
+  if (!USE_NATIVE_TOUCH_EVENTS || event.target.closest(".plain-zoom")) return;
+  if (event.touches.length >= 2) {
+    event.preventDefault();
+    startNativePinch(event);
+    return;
+  }
+  if (event.touches.length !== 1) return;
+
+  event.preventDefault();
+  startNativeDrag(event.touches[0], false);
+}
+
+function handleMapTouchMove(event) {
+  if (!USE_NATIVE_TOUCH_EVENTS) return;
+  if (event.touches.length >= 2) {
+    event.preventDefault();
+    if (!state.touch || state.touch.mode !== "pinch") startNativePinch(event);
+    updateNativePinch(event);
+    return;
+  }
+
+  if (!state.touch || state.touch.mode !== "drag" || event.touches.length !== 1) return;
+  event.preventDefault();
+  const touch = event.touches[0];
+  const dx = touch.clientX - state.touch.startX;
+  const dy = touch.clientY - state.touch.startY;
+  if (!state.touch.moved && Math.abs(dx) + Math.abs(dy) <= MIN_DRAG_DISTANCE_PX) return;
+  state.touch.moved = true;
+  moveMapFromDrag(state.touch.startCenterPx, dx, dy);
+}
+
+function handleMapTouchEnd(event) {
+  if (!USE_NATIVE_TOUCH_EVENTS || !state.touch) return;
+  event.preventDefault();
+
+  if (state.touch.mode === "pinch") {
+    const changed = Boolean(state.touch.changed);
+    if (event.touches.length >= 2) {
+      startNativePinch(event);
+      return;
+    }
+    if (event.touches.length === 1) {
+      startNativeDrag(event.touches[0], true);
+      return;
+    }
+    state.touch = null;
+    if (changed) saveViewportSoon();
+    return;
+  }
+
+  if (event.touches.length > 0) return;
+  const wasDrag = Boolean(state.touch.moved);
+  const touch = event.changedTouches[0];
+  state.touch = null;
+  finishDragOffset();
+  if (wasDrag) {
+    renderMap();
+    saveViewportSoon();
+    return;
+  }
+  if (touch) placeSelectedPoint(touch.clientX, touch.clientY);
+}
+
+function handleMapTouchCancel() {
+  const shouldRender = Boolean(state.touch && state.touch.moved);
+  state.touch = null;
+  state.pointers.clear();
+  state.pinch = null;
+  state.drag = null;
+  finishDragOffset();
+  if (shouldRender) renderMap();
+}
+
+function startNativeDrag(touch, moved) {
+  finishDragOffset();
+  state.pointers.clear();
+  state.pinch = null;
+  state.drag = null;
+  state.touch = {
+    mode: "drag",
+    startX: touch.clientX,
+    startY: touch.clientY,
+    startCenterPx: latLngToPixel(state.center, state.zoom),
+    moved,
+  };
+}
+
+function startNativePinch(event) {
+  const points = getTouchPoints(event.touches);
+  if (points.length < 2) return;
+  finishDragOffset();
+  state.pointers.clear();
+  state.pinch = null;
+  state.drag = null;
+  state.touch = {
+    mode: "pinch",
+    startDistance: getPointDistance(points[0], points[1]),
+    changed: false,
+  };
+}
+
+function updateNativePinch(event) {
+  if (!state.touch || state.touch.mode !== "pinch") return;
+  const points = getTouchPoints(event.touches);
+  if (points.length < 2 || state.touch.startDistance <= 0) return;
+  const distance = getPointDistance(points[0], points[1]);
+  if (distance <= 0) return;
+  const midpoint = getPointMidpoint(points[0], points[1]);
+  if (applyPinchZoom(state.touch, distance, midpoint)) state.touch.changed = true;
 }
 
 function setZoom(zoom, focusClientX, focusClientY) {
@@ -302,6 +412,13 @@ function getPointerPosition(event) {
   };
 }
 
+function getTouchPoints(touches) {
+  return Array.from(touches).slice(0, 2).map((touch) => ({
+    x: touch.clientX,
+    y: touch.clientY,
+  }));
+}
+
 function startPinch() {
   const points = getPinchPoints();
   if (points.length < 2) return;
@@ -320,16 +437,8 @@ function updatePinch() {
   const distance = getPointDistance(points[0], points[1]);
   if (distance <= 0) return;
 
-  const ratio = distance / state.pinch.startDistance;
-  if (ratio < PINCH_ZOOM_STEP_RATIO && ratio > 1 / PINCH_ZOOM_STEP_RATIO) return;
-
   const midpoint = getPointMidpoint(points[0], points[1]);
-  const direction = ratio > 1 ? 1 : -1;
-  const previousZoom = state.zoom;
-  setZoom(state.zoom + direction, midpoint.x, midpoint.y);
-
-  state.pinch.startDistance = distance;
-  if (state.zoom !== previousZoom) state.pinch.changed = true;
+  if (applyPinchZoom(state.pinch, distance, midpoint)) state.pinch.changed = true;
 }
 
 function endPinch() {
@@ -368,6 +477,43 @@ function getPointMidpoint(a, b) {
     x: (a.x + b.x) / 2,
     y: (a.y + b.y) / 2,
   };
+}
+
+function applyPinchZoom(pinchState, distance, midpoint) {
+  const ratio = distance / pinchState.startDistance;
+  if (!Number.isFinite(ratio) || ratio <= 0) return false;
+  let steps = Math.trunc(Math.log(ratio) / Math.log(PINCH_ZOOM_STEP_RATIO));
+  if (!steps) return false;
+  steps = Math.max(-3, Math.min(3, steps));
+  const previousZoom = state.zoom;
+  setZoom(state.zoom + steps, midpoint.x, midpoint.y);
+  pinchState.startDistance = distance;
+  return state.zoom !== previousZoom;
+}
+
+function moveMapFromDrag(startCenterPx, dx, dy) {
+  const mapDx = dx * PAN_SPEED_MULTIPLIER;
+  const mapDy = dy * PAN_SPEED_MULTIPLIER;
+  const nextCenterPx = {
+    x: startCenterPx.x - mapDx,
+    y: startCenterPx.y - mapDy,
+  };
+  state.center = pixelToLatLng(nextCenterPx, state.zoom);
+  scheduleDragOffset(mapDx, mapDy);
+}
+
+function placeSelectedPoint(clientX, clientY) {
+  const point = screenToLatLng(clientX, clientY);
+  if (state.placing === "A") {
+    state.pointA = point;
+  } else {
+    state.pointB = point;
+  }
+
+  saveRoute();
+  refreshTerrainProfile();
+  update();
+  renderMap();
 }
 
 function renderMap() {
