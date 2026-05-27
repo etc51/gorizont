@@ -7,8 +7,10 @@ const DEFAULT_K_FACTOR = 1.33;
 const EDGE_IGNORE_RATIO = 0.1;
 const DEM_SAMPLE_COUNT = 60;
 const DEM_CHUNK_SIZE = 60;
-const PAN_SPEED_MULTIPLIER = 3;
-const TILE_PRELOAD_DELAY_MS = 350;
+const PAN_SPEED_MULTIPLIER = 4.5;
+const TILE_PRELOAD_DELAY_MS = 750;
+const TILE_PRELOAD_LIMIT = 16;
+const TILE_WARMUP_CONCURRENCY = 1;
 const MAX_RETAINED_TILES = 128;
 const CACHE_PREFIX = "rf-calc-cache-v2:";
 const CACHE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
@@ -91,7 +93,7 @@ const elements = {
 };
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
-  navigator.serviceWorker.register("./sw.js?v=20260526-cache12").catch((error) => {
+  navigator.serviceWorker.register("./sw.js?v=20260527-cache13").catch((error) => {
     console.error("Service worker registration failed", error);
   });
 }
@@ -496,7 +498,7 @@ function scheduleNeighborTilePreload(zoom, minTileX, minTileY, maxTileX, maxTile
     }
     preload
       .sort((a, b) => a.distance - b.distance)
-      .slice(0, 32)
+      .slice(0, TILE_PRELOAD_LIMIT)
       .forEach((tile) => warmTileCache(tile.url));
   }, TILE_PRELOAD_DELAY_MS);
 }
@@ -1215,7 +1217,7 @@ function warmTileCache(url) {
 }
 
 function processTileWarmupQueue() {
-  if (state.tileWarmupActive >= 2) return;
+  if (state.tileWarmupActive >= TILE_WARMUP_CONCURRENCY) return;
   const url = state.tileWarmupQueue.shift();
   if (!url) return;
 
